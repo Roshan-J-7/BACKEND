@@ -3,3 +3,11 @@ uvicorn[standard]
 python-dotenv
 requests
 psycopg2-binary
+
+# Vision Model Dependencies
+torch
+torchvision
+transformers
+accelerate
+pillow
+python-multipart

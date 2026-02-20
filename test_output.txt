@@ -1,0 +1,9 @@
+Testing vision API health endpoint...
+Error: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)
+
+
+Testing vision API descriptors endpoint...
+Error: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)
+
+
+Done!

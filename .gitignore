@@ -28,3 +28,16 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Hugging Face Model Cache (IMPORTANT: Don't commit models!)
+.cache/
+models/
+*.bin
+*.safetensors
+*.onnx
+pytorch_model.bin
+model.safetensors
+
+# Downloaded models (if custom cache dir used)
+app/vision_model/models/
+app/vision_model/.cache/

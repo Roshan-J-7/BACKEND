@@ -26,11 +26,30 @@ from app.chatbot.chatbot_routes import router as chatbot_router
 from app.chatbot.chatbot_db import init_db
 app.include_router(chatbot_router)
 
+# ─────────────────────────────
+# Vision Model Routes (PAUSED - Isolated)
+# ─────────────────────────────
+# Vision module is paused and isolated
+# Uncomment below to re-enable when resuming project
+# from app.vision_model.vision_routes import router as vision_router
+# app.include_router(vision_router)
+
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize database tables on startup"""
+    # Initialize database
     init_db()
+    
+    # Vision model loading paused - see app/vision_model/ for details
+    # To resume: uncomment vision imports above and the vision loading code below
+    # 
+    # from app.vision_model.vision_config import VISION_LOAD_ON_STARTUP
+    # if VISION_LOAD_ON_STARTUP:
+    #     import asyncio
+    #     from concurrent.futures import ThreadPoolExecutor
+    #     from app.vision_model.vision_client import vision_client
+    #     ... (rest of vision loading code)
 
 
 # ─────────────────────────────
