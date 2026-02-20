@@ -1,0 +1,55 @@
+# Git
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment (we'll install fresh in container)
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files and scripts
+test_*.py
+create_test_images.py
+simple_test.py
+test_output.txt
+test_images/
+*QUICKSTART.md
+CHAT_API_REFERENCE.md
+
+# Model cache (will download fresh in container if needed)
+.cache/
+models/
+*.bin
+*.safetensors
+*.onnx
+pytorch_model.bin
+model.safetensors
+
+# Documentation (optional, include if needed)
+# README.md
+
+# Environment file (handle separately for production)
+# .env will be passed via docker-compose or AWS secrets

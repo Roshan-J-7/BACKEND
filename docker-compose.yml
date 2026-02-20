@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  healthcare-chatbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: healthcare-chatbot:latest
+    container_name: healthcare-chatbot-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Pass environment variables from .env file
+      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
+      # Optional: Override default settings
+      - PYTHONUNBUFFERED=1
+      - HF_HOME=/app/.cache
+    env_file:
+      - .env
+    volumes:
+      # Mount model cache to persist downloaded models (optional)
+      - model-cache:/app/.cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - chatbot-network
+
+  # Optional: Add nginx reverse proxy for production
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: healthcare-chatbot-nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     - healthcare-chatbot
+  #   networks:
+  #     - chatbot-network
+
+volumes:
+  model-cache:
+    driver: local
+
+networks:
+  chatbot-network:
+    driver: bridge

@@ -41,3 +41,12 @@ model.safetensors
 # Downloaded models (if custom cache dir used)
 app/vision_model/models/
 app/vision_model/.cache/
+
+# Test files and scripts (keep local, exclude from git/docker)
+test_*.py
+create_test_images.py
+simple_test.py
+test_output.txt
+test_images/
+*QUICKSTART.md
+CHAT_API_REFERENCE.md
