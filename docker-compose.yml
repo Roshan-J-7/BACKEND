@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # FastAPI Application Service
   healthcare-chatbot:
     build:
       context: .
@@ -12,14 +13,20 @@ services:
     environment:
       # Pass environment variables from .env file
       - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
+      - CHATBOT_CEREBRAS_API_KEY=${CHATBOT_CEREBRAS_API_KEY}
       # Optional: Override default settings
       - PYTHONUNBUFFERED=1
       - HF_HOME=/app/.cache
+      # Database URL for Docker (connecting to Windows PostgreSQL via TCP/IP)
+      # Note: @ symbol in password must be URL-encoded as %40
+      - DATABASE_URL=postgresql://postgres:Pratyushsec077%40@host.docker.internal:5432/DeepBlue
     env_file:
       - .env
     volumes:
-      # Mount model cache to persist downloaded models (optional)
+      # Mount model cache to persist downloaded models
       - model-cache:/app/.cache
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

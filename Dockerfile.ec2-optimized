@@ -1,0 +1,42 @@
+# Optimized Dockerfile for EC2 t2.micro (1GB RAM)
+# Use smaller base image
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install only runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install
+COPY requirements.txt .
+
+# Install with reduced cache and optimize for smaller RAM
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    # Clear pip cache to save space
+    rm -rf /root/.cache/pip
+
+# Copy application
+COPY app/ ./app/
+COPY config/ ./config/
+COPY README.md .
+
+# Set optimal environment variables for low RAM
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HOME=/app/.cache \
+    TRANSFORMERS_CACHE=/app/.cache \
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
+    OMP_NUM_THREADS=1
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Use single worker for low RAM
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

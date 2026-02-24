@@ -1,0 +1,50 @@
+{
+  "family": "healthcare-chatbot-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "healthcare-chatbot",
+      "image": "ACCOUNT_ID.dkr.ecr.eu-north-1.amazonaws.com/healthcare-chatbot:latest",
+      "cpu": 1024,
+      "memory": 2048,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {
+          "name": "CEREBRAS_API_KEY",
+          "value": "csk-fe8ntvvnx6d8rvnky45dhp5y8j6et5kffy4pcy84kr8264ew"
+        },
+        {
+          "name": "CHATBOT_CEREBRAS_API_KEY",
+          "value": "csk-5tmvfx29vmkjrcjyvrfv4pvwydp5ke6vfxed6pmt4m2drxkv"
+        },
+        {
+          "name": "DATABASE_URL",
+          "value": "postgresql://postgres:Pratyushsec077@RDS_ENDPOINT:5432/DeepBlue"
+        },
+        {
+          "name": "PYTHONUNBUFFERED",
+          "value": "1"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/healthcare-chatbot",
+          "awslogs-region": "eu-north-1",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

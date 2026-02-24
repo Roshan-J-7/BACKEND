@@ -17,19 +17,22 @@ load_dotenv()
 # Database Configuration
 # ─────────────────────────────
 
-DB_CONFIG = {
-    "host": os.getenv("POSTGRES_HOST", "localhost"),
-    "port": int(os.getenv("POSTGRES_PORT", "5432")),
-    "dbname": os.getenv("POSTGRES_DB", "DeepBlue"),
-    "user": os.getenv("POSTGRES_USER", "postgres"),
-    "password": os.getenv("POSTGRES_PASSWORD"),
-}
+# Support both DATABASE_URL (for Docker) and individual env vars (for local)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"postgresql://{os.getenv('POSTGRES_USER', 'postgres')}:"
+    f"{os.getenv('POSTGRES_PASSWORD', '')}@"
+    f"{os.getenv('POSTGRES_HOST', 'localhost')}:"
+    f"{os.getenv('POSTGRES_PORT', '5432')}/"
+    f"{os.getenv('POSTGRES_DB', 'DeepBlue')}"
+)
 
 
 def get_connection():
     """Get a new database connection"""
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        # Use DATABASE_URL if available, otherwise fall back to individual params
+        conn = psycopg2.connect(DATABASE_URL)
         return conn
     except psycopg2.Error as e:
         raise Exception(f"Database connection failed: {str(e)}")
