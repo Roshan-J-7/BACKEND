@@ -1,33 +1,88 @@
 """
-S2 — Web Routes
-Exact replica of S1 (main.py) routes, served under /web prefix.
-Used exclusively by the Kiosk/Website (Roshan's frontend).
-S1 routes remain untouched for the mobile app (Gowtham's Kotlin app).
+S2 — Web Server (CURA Kiosk / Website)
+=======================================
+Exact functional duplicate of app/main.py — ALL endpoints prefixed with /web/
+
+S1 (app/main.py)   → routes: /assessment/*, /followup/*, /chat, /symptom/*, /session/*
+S2 (this file)     → routes: /web/assessment/*, /web/followup/*, /web/chat (legacy),
+                               /web/symptom/*, /web/session/*
+
+S2 chatbot routes  → /web/chat/* (from app_web/chatbot/chatbot_routes.py)
+
+WHY THIS EXISTS:
+- S1 stays frozen for Gowtham's Kotlin app (slow UI iteration)
+- S2 is developed freely alongside Roshan's website/kiosk
+- Same DB, same core logic — diverge only where web needs differ
+- Entry point: web_server.py  →  uvicorn app_web.main:app
+
+TO EDIT S2 ONLY: modify files in app_web/ — never touch app/
 """
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 import uuid
 import json
 import os
-from fastapi import APIRouter
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-
-router = APIRouter(prefix="/web", tags=["Web (S2)"])
 
 # ─────────────────────────────
-# S2 — OWN SESSION STORES
-# (isolated from S1 — no shared state)
+# S2 FastAPI App
 # ─────────────────────────────
-web_session_store = {}
-web_followup_store = {}
-web_conversation_history = {}
-web_sessions = {}
-web_followup_sessions = {}
-web_current_context = {}  # keyed by session_id (unlike S1 which uses globals)
+app = FastAPI(
+    title="CURA Med Assistant — S2 Web Server",
+    version="1.0.0",
+    description="Web/Kiosk server. All endpoints are under /web/ prefix."
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─────────────────────────────
+# Include S2 Chatbot Routes  (/web/chat/*)
+# ─────────────────────────────
+from app_web.chatbot.chatbot_routes import router as web_chatbot_router
+from app.chatbot.chatbot_db import init_db   # Shared DB — same PostgreSQL instance
+
+app.include_router(web_chatbot_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize shared DB tables on S2 startup"""
+    init_db()
 
 
 # ─────────────────────────────
-# DTOs (same as S1)
+# Data Loading Helpers
+# (Points to app/data/ — single source of truth for data files)
+# ─────────────────────────────
+
+def _data_path(filename: str) -> str:
+    """Resolve path to shared data files in app/data/"""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),  # project root
+        "app", "data", filename
+    )
+
+
+def load_questionnaire():
+    with open(_data_path("questionnaire.json"), "r") as f:
+        return json.load(f)
+
+
+def load_decision_tree():
+    with open(_data_path("decision_tree.json"), "r") as f:
+        return json.load(f)
+
+
+# ─────────────────────────────
+# DTOs  (identical to S1)
 # ─────────────────────────────
 
 class ContextRequest(BaseModel):
@@ -72,14 +127,6 @@ class AnswerValue(BaseModel):
     value: str
 
 
-class AnswerRequest(BaseModel):
-    session_id: str
-    phase: str
-    question_id: Optional[str] = None
-    answer: Optional[AnswerValue] = None
-    user_message: Optional[str] = None
-
-
 class Question(BaseModel):
     question_id: str
     text: str
@@ -95,8 +142,12 @@ class AssessmentStartResponse(BaseModel):
 
 class AnswerRequest(BaseModel):
     session_id: str
-    question: Question
-    answer: Dict[str, Any]
+    question: Optional[Question] = None
+    answer: Optional[Dict[str, Any]] = None
+    phase: Optional[str] = None
+    question_id: Optional[str] = None
+    answer_value: Optional[AnswerValue] = None
+    user_message: Optional[str] = None
 
 
 class AnswerResponse(BaseModel):
@@ -168,26 +219,26 @@ class MedicalReportResponse(BaseModel):
 
 
 # ─────────────────────────────
-# HELPER FUNCTIONS
+# S2 In-Memory State (isolated from S1)
+# ─────────────────────────────
+web_sessions = {}
+web_session_store = {}
+web_followup_sessions = {}
+web_followup_store = {}
+web_conversation_history = {}
+web_current_context = None
+web_current_session_id = None
+
+
+# ─────────────────────────────
+# Helpers
 # ─────────────────────────────
 
-def _load_questionnaire():
-    json_path = os.path.join(os.path.dirname(__file__), "..", "data", "questionnaire.json")
-    with open(json_path, "r") as f:
-        return json.load(f)
-
-
-def _load_decision_tree():
-    json_path = os.path.join(os.path.dirname(__file__), "..", "data", "decision_tree.json")
-    with open(json_path, "r") as f:
-        return json.load(f)
-
-
-def _detect_symptom(complaint_text: str) -> Optional[Dict[str, Any]]:
+def detect_symptom(complaint_text: str) -> Optional[Dict[str, Any]]:
     if not complaint_text:
         return None
     complaint_lower = complaint_text.lower().strip()
-    decision_tree = _load_decision_tree()
+    decision_tree = load_decision_tree()
     symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
     for symptom in symptoms:
         for keyword in symptom.get("keywords", []):
@@ -201,7 +252,19 @@ def _detect_symptom(complaint_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _build_question_response(question_data: dict) -> Question:
+def cleanup_session(session_id: str) -> bool:
+    found = False
+    for store in [web_sessions, web_conversation_history, web_session_store,
+                  web_followup_sessions, web_followup_store]:
+        if session_id in store:
+            del store[session_id]
+            found = True
+    if found:
+        print(f"[S2 CLEANUP] Session {session_id} removed")
+    return found
+
+
+def build_question_response(question_data: dict) -> Question:
     question = Question(
         question_id=question_data["id"],
         text=question_data["text"],
@@ -217,27 +280,15 @@ def _build_question_response(question_data: dict) -> Question:
     return question
 
 
-def _cleanup_session(session_id: str) -> bool:
-    found = False
-    for store in [web_sessions, web_conversation_history, web_session_store,
-                  web_followup_sessions, web_followup_store, web_current_context]:
-        if session_id in store:
-            del store[session_id]
-            found = True
-    if found:
-        print(f"[WEB CLEANUP] Session {session_id} removed from all S2 stores")
-    return found
+# ─────────────────────────────
+# S2 PRODUCTION ENDPOINTS   /web/*
+# ─────────────────────────────
 
-
-# ═════════════════════════════════════════════════════════════
-# PRODUCTION ENDPOINTS — /web/assessment/*
-# ═════════════════════════════════════════════════════════════
-
-@router.get("/assessment/start", response_model=AssessmentStartResponse)
+@app.get("/web/assessment/start", response_model=AssessmentStartResponse)
 def web_start_assessment():
-    """[S2] Start assessment — returns first question"""
+    """[S2] Start assessment — GET /web/assessment/start"""
     session_id = str(uuid.uuid4())
-    questionnaire = _load_questionnaire()
+    questionnaire = load_questionnaire()
     first_q = questionnaire["questions"][0]
 
     web_sessions[session_id] = {
@@ -250,21 +301,21 @@ def web_start_assessment():
         "detected_symptom": None
     }
 
-    question = _build_question_response(first_q)
-    print(f"\n[WEB START] New session: {session_id[:8]}... | First question: {first_q['id']}")
+    question = build_question_response(first_q)
+    print(f"\n[S2 START] New session: {session_id[:8]}...")
     return AssessmentStartResponse(session_id=session_id, question=question)
 
 
-@router.post("/assessment/answer", response_model=AnswerResponse)
+@app.post("/web/assessment/answer", response_model=AnswerResponse)
 def web_submit_answer(req: AnswerRequest):
-    """[S2] Handle answer — return next question"""
+    """[S2] Submit answer — POST /web/assessment/answer"""
     session_id = req.session_id
 
     if session_id not in web_sessions:
         return AnswerResponse(session_id=session_id, status="error")
 
-    answer_data = req.answer
-    question_id = req.question.question_id
+    answer_data = req.answer or {}
+    question_id = req.question.question_id if req.question else req.question_id
 
     if answer_data.get("type") == "number":
         answer_value = answer_data.get("value")
@@ -276,32 +327,33 @@ def web_submit_answer(req: AnswerRequest):
         answer_value = answer_data.get("value", "")
 
     web_sessions[session_id]["answers"][question_id] = answer_value
-    print(f"[WEB ANSWER] Session {session_id[:8]}... answered {question_id}: {answer_value}")
+    print(f"[S2 ANSWER] {session_id[:8]}... {question_id}: {answer_value}")
 
     phase = web_sessions[session_id].get("phase", "questionnaire")
 
     if phase == "questionnaire":
-        questionnaire = _load_questionnaire()
+        questionnaire = load_questionnaire()
         all_questions = questionnaire["questions"].copy()
         answers = web_sessions[session_id]["answers"]
 
-        if answers.get("q_gender", "").lower() == "female":
-            all_questions.extend(questionnaire.get("conditional", {}).get("q_gender=female", []))
+        gender = answers.get("q_gender")
+        if gender and gender.lower() == "female":
+            conditional = questionnaire.get("conditional", {}).get("q_gender=female", [])
+            all_questions.extend(conditional)
 
         current_index = web_sessions[session_id]["current_index"]
         next_index = current_index + 1
 
         if next_index >= len(all_questions):
             chief_complaint = answers.get("q_current_ailment", "")
-            detected = _detect_symptom(chief_complaint) if chief_complaint else None
+            detected = detect_symptom(chief_complaint) if chief_complaint else None
 
             if detected:
                 symptom_id = detected["symptom_id"]
-                decision_tree = _load_decision_tree()
-                symptom_data = next(
-                    (s for s in decision_tree["symptom_decision_tree"]["symptoms"] if s["symptom_id"] == symptom_id),
-                    None
-                )
+                decision_tree = load_decision_tree()
+                symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
+                symptom_data = next((s for s in symptoms if s["symptom_id"] == symptom_id), None)
+
                 if symptom_data and "followup_questions" in symptom_data:
                     followup_qs = symptom_data["followup_questions"]
                     question_keys = list(followup_qs.keys())
@@ -314,6 +366,7 @@ def web_submit_answer(req: AnswerRequest):
 
                     first_key = question_keys[0]
                     first_q_data = followup_qs[first_key]
+
                     question = Question(
                         question_id=first_key,
                         text=first_q_data["question"],
@@ -330,7 +383,7 @@ def web_submit_answer(req: AnswerRequest):
 
         web_sessions[session_id]["current_index"] = next_index
         next_q = all_questions[next_index]
-        question = _build_question_response(next_q)
+        question = build_question_response(next_q)
         return AnswerResponse(session_id=session_id, question=question)
 
     else:
@@ -346,6 +399,7 @@ def web_submit_answer(req: AnswerRequest):
         web_sessions[session_id]["followup_index"] = next_index
         next_key = question_keys[next_index]
         next_q_data = followup_qs[next_key]
+
         question = Question(
             question_id=next_key,
             text=next_q_data["question"],
@@ -359,9 +413,9 @@ def web_submit_answer(req: AnswerRequest):
         return AnswerResponse(session_id=session_id, question=question)
 
 
-@router.post("/assessment/report", response_model=MedicalReportResponse)
+@app.post("/web/assessment/report", response_model=MedicalReportResponse)
 def web_receive_report(req: ReportRequest):
-    """[S2] Generate medical report from completed assessment"""
+    """[S2] Generate medical report — POST /web/assessment/report"""
     from app.core.llm_client import generate_medical_report
 
     session_id = req.session_id or str(uuid.uuid4())
@@ -377,36 +431,36 @@ def web_receive_report(req: ReportRequest):
     detected_symptom = None
     symptom_data = None
     if chief_complaint:
-        detected_symptom = _detect_symptom(chief_complaint)
+        detected_symptom = detect_symptom(chief_complaint)
         if detected_symptom:
-            decision_tree = _load_decision_tree()
+            decision_tree = load_decision_tree()
             for s in decision_tree["symptom_decision_tree"]["symptoms"]:
                 if s["symptom_id"] == detected_symptom["symptom_id"]:
                     symptom_data = s
                     break
 
-    print(f"[WEB REPORT] Session {session_id[:8]}... | {len(req.responses)} responses | Symptom: {detected_symptom}")
+    print(f"[S2 REPORT] Generating for session {session_id[:8]}...")
     medical_report = generate_medical_report(responses_data, symptom_data)
     return MedicalReportResponse(**medical_report)
 
 
-@router.post("/assessment/end", response_model=EndSessionResponse)
+@app.post("/web/assessment/end", response_model=EndSessionResponse)
 def web_end_assessment(request: EndSessionRequest):
-    """[S2] End assessment — cleanup session"""
-    existed = _cleanup_session(request.session_id)
+    """[S2] End assessment session — POST /web/assessment/end"""
+    existed = cleanup_session(request.session_id)
     return EndSessionResponse(status="ended" if existed else "not_found")
 
 
-# ═════════════════════════════════════════════════════════════
-# SYMPTOM DETECTION & FOLLOW-UP — /web/symptom/*, /web/followup/*
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────
+# S2 SYMPTOM / FOLLOWUP ENDPOINTS   /web/symptom/*  /web/followup/*
+# ─────────────────────────────
 
-@router.get("/symptom/detect")
+@app.get("/web/symptom/detect")
 def web_detect_symptom(complaint: str):
-    """[S2] Detect symptom from chief complaint"""
+    """[S2] Detect symptom — GET /web/symptom/detect"""
     if not complaint or not complaint.strip():
         return {"error": "Complaint text is required"}
-    result = _detect_symptom(complaint)
+    result = detect_symptom(complaint)
     if result:
         return {
             "detected": True,
@@ -416,21 +470,16 @@ def web_detect_symptom(complaint: str):
             "default_urgency": result["default_urgency"],
             "next_step": f"Call /web/followup/start?symptom={result['symptom_id']}"
         }
-    return {
-        "detected": False,
-        "message": "No matching symptom found.",
-        "suggestion": "User may need general medical consultation."
-    }
+    return {"detected": False, "message": "No matching symptom found."}
 
 
-@router.get("/followup/start")
+@app.get("/web/followup/start")
 def web_start_followup(symptom: str):
-    """[S2] Start symptom-specific follow-up questions"""
-    decision_tree = _load_decision_tree()
-    symptom_data = next(
-        (s for s in decision_tree["symptom_decision_tree"]["symptoms"] if s["symptom_id"] == symptom),
-        None
-    )
+    """[S2] Start follow-up questions — GET /web/followup/start"""
+    decision_tree = load_decision_tree()
+    symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
+    symptom_data = next((s for s in symptoms if s["symptom_id"] == symptom), None)
+
     if not symptom_data:
         return {"error": f"Symptom '{symptom}' not found."}
 
@@ -469,16 +518,17 @@ def web_start_followup(symptom: str):
     return response
 
 
-@router.post("/followup/answer")
+@app.post("/web/followup/answer")
 def web_answer_followup(req: AnswerRequest):
-    """[S2] Submit follow-up answer — return next question"""
+    """[S2] Answer follow-up question — POST /web/followup/answer"""
     session_id = req.session_id
     if session_id not in web_followup_sessions:
         return {"error": "Session not found"}
 
     session = web_followup_sessions[session_id]
-    current_index = session["current_index"]
     question_keys = session["question_keys"]
+    all_questions = session["all_questions"]
+    current_index = session["current_index"]
 
     session["responses"].append({"question": req.question, "answer": req.answer})
     current_index += 1
@@ -492,10 +542,15 @@ def web_answer_followup(req: AnswerRequest):
         }
 
     next_key = question_keys[current_index]
-    next_q_data = session["all_questions"][next_key]
+    next_q_data = all_questions[next_key]
+
     response = {
         "session_id": session_id,
-        "question": {"question_id": next_key, "text": next_q_data["question"], "response_type": next_q_data["type"]},
+        "question": {
+            "question_id": next_key,
+            "text": next_q_data["question"],
+            "response_type": next_q_data["type"]
+        },
         "is_last": (current_index == len(question_keys) - 1)
     }
     if "options" in next_q_data:
@@ -506,39 +561,43 @@ def web_answer_followup(req: AnswerRequest):
     return response
 
 
-@router.post("/followup/report", response_model=ReportResponse)
+@app.post("/web/followup/report", response_model=ReportResponse)
 def web_receive_followup_report(req: ReportRequest):
-    """[S2] Store follow-up report"""
+    """[S2] Submit follow-up report — POST /web/followup/report"""
     session_id = req.session_id or str(uuid.uuid4())
     web_followup_store[session_id] = [qa.dict() for qa in req.responses]
-    print(f"[WEB FOLLOWUP REPORT] Session {session_id[:8]}... | {len(req.responses)} responses")
+    print(f"[S2 FOLLOWUP REPORT] {len(req.responses)} responses for {session_id[:8]}...")
     return ReportResponse(
         report_id=session_id,
         summary=f"Follow-up assessment completed with {len(req.responses)} responses."
     )
 
 
-# ═════════════════════════════════════════════════════════════
-# LEGACY / CONTEXT ENDPOINTS — /web/session/*, /web/chat
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────
+# S2 LEGACY ENDPOINTS   /web/session/*  /web/chat (legacy)
+# ─────────────────────────────
 
-@router.post("/session/context", response_model=AssessmentResponse)
+@app.post("/web/session/context", response_model=AssessmentResponse)
 def web_receive_context(req: ContextRequest):
-    """[S2] Receive context and start questionnaire"""
+    """[S2 Legacy] Receive context — POST /web/session/context"""
+    global web_current_context, web_current_session_id
+
     if req.questionnaire_context:
-        web_current_context[req.session_id] = {
+        web_current_context = {
             "session_id": req.session_id,
             "user_choice": req.user_choice,
             "answers": req.questionnaire_context
         }
+        web_current_session_id = req.session_id
         return AssessmentResponse(
             session_id=req.session_id,
             phase="llm",
             message="Thanks. I'll ask a few questions to better understand your condition."
         )
 
+    web_current_session_id = req.session_id
     web_sessions[req.session_id] = {"answers": {}, "user_choice": req.user_choice}
-    questionnaire = _load_questionnaire()
+    questionnaire = load_questionnaire()
     first_question = questionnaire["questions"][0]
     total_questions = len(questionnaire["questions"])
 
@@ -566,30 +625,40 @@ def web_receive_context(req: ContextRequest):
     )
 
 
-@router.post("/chat", response_model=AssessmentResponse)
-def web_submit_answer_chat(req: AnswerRequest):
-    """[S2] Handle questionnaire answers and LLM phase"""
+@app.post("/web/session/end")
+def web_end_session(request: Dict[str, str]):
+    """[S2 Legacy] End session — POST /web/session/end"""
+    session_id = request.get("session_id")
+    if not session_id:
+        return {"status": "error", "message": "session_id required"}
+    cleanup_session(session_id)
+    return {"status": "ok", "message": f"Session {session_id[:8]}... ended"}
 
-    # ─── PREDEFINED PHASE
+
+@app.post("/web/chat", response_model=AssessmentResponse)
+def web_legacy_chat(req: AnswerRequest):
+    """[S2 Legacy] Chat endpoint — POST /web/chat"""
     if req.phase == "predefined":
         if req.session_id not in web_sessions:
             web_sessions[req.session_id] = {"answers": {}}
 
         if req.question_id:
-            web_sessions[req.session_id]["answers"][req.question_id] = req.answer.value
+            web_sessions[req.session_id]["answers"][req.question_id] = req.answer_value.value if req.answer_value else None
 
-        questionnaire = _load_questionnaire()
+        questionnaire = load_questionnaire()
         all_questions = questionnaire["questions"].copy()
         answers = web_sessions[req.session_id]["answers"]
 
-        if answers.get("q_gender") == "female":
+        if "q_gender" in answers and answers["q_gender"] == "female":
             all_questions.extend(questionnaire.get("conditional", {}).get("q_gender=female", []))
 
-        current_index = next(
-            (i for i, q in enumerate(all_questions) if q["id"] == req.question_id), -1
-        )
-        next_index = current_index + 1
+        current_index = -1
+        for i, q in enumerate(all_questions):
+            if q["id"] == req.question_id:
+                current_index = i
+                break
 
+        next_index = current_index + 1
         if next_index >= len(all_questions):
             return AssessmentResponse(
                 session_id=req.session_id,
@@ -622,18 +691,11 @@ def web_submit_answer_chat(req: AnswerRequest):
             progress=Progress(current=next_index + 1, total=len(all_questions))
         )
 
-    # ─── LLM PHASE
     if req.phase == "llm":
-        context = web_current_context.get(req.session_id)
+        if not web_current_context:
+            return AssessmentResponse(session_id=req.session_id, phase="end", message="Session expired. Please start over.")
 
-        if not context:
-            return AssessmentResponse(
-                session_id=req.session_id,
-                phase="end",
-                message="Session expired. Please start over."
-            )
-
-        answers = context["answers"]
+        answers = web_current_context["answers"]
         user_msg = req.user_message or ""
 
         if req.session_id not in web_conversation_history:
@@ -682,7 +744,11 @@ def web_submit_answer_chat(req: AnswerRequest):
             else:
                 from app.core.llm_client import get_llm_response
                 conv_text = "\n".join([f"{m['role']}: {m['content']}" for m in session_data["messages"][-6:]])
-                prompt = f"Conversation:\n{conv_text}\n\nBased on this info about their {session_data['schema'].get('current_complaint', 'condition')}, either ask ONE more relevant clarifying question OR provide analysis with urgency and advice if you have enough information."
+                prompt = (
+                    f"Conversation:\n{conv_text}\n\nBased on this info about their "
+                    f"{session_data['schema'].get('current_complaint', 'condition')}, "
+                    "either ask ONE more relevant clarifying question OR provide analysis with urgency and advice."
+                )
                 llm_resp = get_llm_response(session_data["schema"], session_data["guidance"], prompt)
 
                 if llm_resp.get("type") == "question":
@@ -694,66 +760,62 @@ def web_submit_answer_chat(req: AnswerRequest):
                     summary = llm_resp.get("summary", "Based on your symptoms...")
                     advice = llm_resp.get("advice", ["Rest and monitor", "See a doctor if symptoms worsen"])
                     urgency = llm_resp.get("urgency", "self_care")
-                    full_msg = (
-                        f"## Summary\n{summary}\n\n"
-                        f"**Urgency:** {urgency.replace('_', ' ').title()}\n\n"
-                        f"## What to do:\n" + "\n".join([f"• {a}" for a in advice]) +
-                        "\n\n*This is general guidance. Consult a healthcare provider for personalized advice.*"
-                    )
-                    _cleanup_session(req.session_id)
+                    full_msg = f"## Summary\n{summary}\n\n**Urgency:** {urgency.replace('_', ' ').title()}\n\n"
+                    full_msg += "## What to do:\n" + "\n".join([f"• {a}" for a in advice])
+                    full_msg += "\n\n*This is general guidance. Consult a healthcare provider for personalized advice.*"
+                    cleanup_session(req.session_id)
                     return AssessmentResponse(session_id=req.session_id, phase="end", message=full_msg)
+
+        return AssessmentResponse(session_id=req.session_id, phase="end", message="An error occurred. Please restart.")
 
     return AssessmentResponse(session_id=req.session_id, phase="end", message="Assessment completed. Take care.")
 
 
-@router.post("/session/end")
-def web_end_session(request: Dict[str, str]):
-    """[S2] Cleanup session"""
-    session_id = request.get("session_id")
-    if not session_id:
-        return {"status": "error", "message": "session_id required"}
-    _cleanup_session(session_id)
-    return {"status": "ok", "message": f"Session {session_id[:8]}... ended"}
+# ─────────────────────────────
+# S2 HEALTH & DEBUG   /web/health  /web/debug/*
+# ─────────────────────────────
 
-
-# ═════════════════════════════════════════════════════════════
-# HEALTH & DEBUG — /web/health, /web/debug/*
-# ═════════════════════════════════════════════════════════════
-
-@router.get("/health")
+@app.get("/web/health")
 def web_health_check():
-    return {"status": "ok", "server": "S2 (web)"}
+    """[S2] Health check — GET /web/health"""
+    return {"status": "ok", "server": "S2-web"}
 
 
-@router.get("/debug/sessions")
+@app.get("/web/debug/sessions")
 def web_view_all_sessions():
+    """[S2] Debug all sessions"""
     return {
         "status": "ok",
+        "server": "S2",
         "active_sessions": list(web_session_store.keys()),
         "session_count": len(web_session_store),
         "sessions": web_session_store
     }
 
 
-@router.get("/debug/session/{session_id}")
-def web_view_session_data(session_id: str):
+@app.get("/web/debug/session/{session_id}")
+def web_view_session(session_id: str):
+    """[S2] Debug specific session"""
     if session_id not in web_session_store:
         return {"status": "not_found", "session_id": session_id}
     return {
         "status": "ok",
+        "server": "S2",
         "session_id": session_id,
         "response_count": len(web_session_store[session_id]),
         "responses": web_session_store[session_id]
     }
 
 
-@router.get("/debug/conversation/{session_id}")
+@app.get("/web/debug/conversation/{session_id}")
 def web_view_conversation(session_id: str):
+    """[S2] Debug conversation history"""
     if session_id not in web_conversation_history:
         return {"status": "empty", "session_id": session_id}
     session_data = web_conversation_history[session_id]
     return {
         "status": "ok",
+        "server": "S2",
         "session_id": session_id,
         "medical_schema": session_data.get("schema"),
         "matched_symptoms": session_data.get("guidance", {}).get("matched_symptoms", []),
