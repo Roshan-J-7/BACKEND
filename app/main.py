@@ -20,11 +20,19 @@ app.add_middleware(
 )
 
 # ─────────────────────────────
-# Include Chatbot Routes
+# S1 — App Routes (Chatbot)
 # ─────────────────────────────
 from app.chatbot.chatbot_routes import router as chatbot_router
 from app.chatbot.chatbot_db import init_db
-app.include_router(chatbot_router)
+app.include_router(chatbot_router)  # /chat/*
+
+# ─────────────────────────────
+# S2 — Web Routes (Kiosk / Website)
+# Exact replica of S1, served under /web prefix
+# ─────────────────────────────
+from app.web.web_routes import router as web_router
+app.include_router(web_router)          # /web/assessment/*, /web/chat, /web/followup/*, etc.
+app.include_router(chatbot_router, prefix="/web")  # /web/chat/* (chatbot endpoints for web)
 
 # ─────────────────────────────
 # Vision Model Routes (PAUSED - Isolated)
