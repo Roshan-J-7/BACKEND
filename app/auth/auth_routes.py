@@ -29,7 +29,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 # ─────────────────────────────
 # Password hashing (bcrypt)
 # ─────────────────────────────
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__truncate_error=False)
 
 
 def hash_password(plain: str) -> str:
