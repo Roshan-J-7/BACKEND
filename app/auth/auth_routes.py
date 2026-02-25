@@ -12,7 +12,8 @@ Isolated from all other routes. Does not import from chatbot/, core/, or vision_
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt
@@ -63,22 +64,11 @@ class AuthRequest(BaseModel):
     password: str
 
 
-class SignupResponse(BaseModel):
-    success: bool
-    message: str
-
-
-class LoginResponse(BaseModel):
-    success: bool
-    message: str
-    token: str | None = None
-
-
 # ─────────────────────────────
 # Endpoints
 # ─────────────────────────────
 
-@router.post("/signup", response_model=SignupResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/signup", status_code=status.HTTP_201_CREATED)
 def signup(req: AuthRequest):
     """
     Register a new user.
@@ -88,24 +78,27 @@ def signup(req: AuthRequest):
     - Stores (email, hashed_password) in `users` table
     """
     if email_exists(req.email):
-        raise HTTPException(
+        return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"success": False, "message": "User already exists"}
+            content={"success": False, "message": "User already exists"}
         )
 
     try:
         hashed = hash_password(req.password)
         create_user(email=req.email, hashed_password=hashed)
     except Exception as e:
-        raise HTTPException(
+        return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"success": False, "message": f"Internal server error: {str(e)}"}
+            content={"success": False, "message": f"Internal server error: {str(e)}"}
         )
 
-    return SignupResponse(success=True, message="User created successfully")
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content={"success": True, "message": "User created successfully"}
+    )
 
 
-@router.post("/login", response_model=LoginResponse, status_code=status.HTTP_200_OK)
+@router.post("/login", status_code=status.HTTP_200_OK)
 def login(req: AuthRequest):
     """
     Authenticate user and return a JWT.
@@ -117,15 +110,14 @@ def login(req: AuthRequest):
     user = get_user_by_email(req.email)
 
     if not user or not verify_password(req.password, user["hashed_password"]):
-        raise HTTPException(
+        return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"success": False, "message": "Invalid credentials"}
+            content={"success": False, "message": "Invalid credentials"}
         )
 
     token = create_jwt(user_id=str(user["id"]), email=user["email"])
 
-    return LoginResponse(
-        success=True,
-        message="Login successful",
-        token=token
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"success": True, "message": "Login successful", "token": token}
     )
