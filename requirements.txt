@@ -4,6 +4,11 @@ python-dotenv
 requests
 psycopg2-binary
 
+# Auth dependencies
+passlib[bcrypt]
+python-jose[cryptography]
+email-validator
+
 # Vision Model Dependencies
 torch
 torchvision

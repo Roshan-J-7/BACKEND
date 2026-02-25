@@ -1,0 +1,1 @@
+# Auth module — signup / login

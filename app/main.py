@@ -27,6 +27,13 @@ from app.chatbot.chatbot_db import init_db
 app.include_router(chatbot_router)
 
 # ─────────────────────────────
+# Include Auth Routes  (/auth/signup  /auth/login)
+# ─────────────────────────────
+from app.auth.auth_routes import router as auth_router
+from app.auth.auth_db import init_auth_db
+app.include_router(auth_router)
+
+# ─────────────────────────────
 # Vision Model Routes (PAUSED - Isolated)
 # ─────────────────────────────
 # Vision module is paused and isolated
@@ -38,8 +45,10 @@ app.include_router(chatbot_router)
 @app.on_event("startup")
 async def startup_event():
     """Initialize database tables on startup"""
-    # Initialize database
+    # Initialize chatbot DB (chat_sessions table)
     init_db()
+    # Initialize auth DB (users table — separate from chat_sessions)
+    init_auth_db()
     
     # Vision model loading paused - see app/vision_model/ for details
     # To resume: uncomment vision imports above and the vision loading code below
