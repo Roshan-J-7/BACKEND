@@ -13,7 +13,7 @@ Isolated from all other routes. Does not import from chatbot/, core/, or vision_
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt
 
@@ -59,7 +59,7 @@ def create_jwt(user_id: str, email: str) -> str:
 # ─────────────────────────────
 
 class AuthRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 
