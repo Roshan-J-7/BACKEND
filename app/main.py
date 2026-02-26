@@ -400,23 +400,35 @@ def start_assessment(request: Request):
     # ── Fetch stored answers from JWT (optional) ──────────────────────
     stored_answers = []
     auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
+
+    print(f"[START] Auth header present: {bool(auth_header)}")
+
+    if not auth_header.startswith("Bearer "):
+        print("[START] WARNING: No Bearer token in Authorization header — stored_answers will be empty")
+    else:
         token = auth_header.split(" ", 1)[1].strip()
         try:
             payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
             user_id = payload.get("sub")
-            if user_id:
-                # Merge profile + medical answers (profile first, then medical)
+            print(f"[START] JWT decoded OK — user_id: {user_id}")
+
+            if not user_id:
+                print("[START] WARNING: JWT has no 'sub' field — stored_answers will be empty")
+            else:
                 profile_rows = get_profile_by_user_id(user_id)
                 medical_rows = get_medical_by_user_id(user_id)
+                print(f"[START] Profile rows: {len(profile_rows)} | Medical rows: {len(medical_rows)}")
+
                 for row in profile_rows + medical_rows:
                     stored_answers.append(StoredAnswer(
                         question_id=row["question_id"],
                         question_text=row["question_text"],
                         answer_json=row["answer_json"]
                     ))
-        except JWTError:
-            pass  # No stored answers — app collects fresh
+        except JWTError as e:
+            print(f"[START] JWT decode error: {e} — stored_answers will be empty")
+        except Exception as e:
+            print(f"[START] DB fetch error: {e} — stored_answers will be empty")
 
     print(f"\n[START] New session: {session_id[:8]}...")
     print(f"[START] First question: {first_q['id']}")
