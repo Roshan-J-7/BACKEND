@@ -1,10 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uuid
 import json
 import os
+from jose import jwt, JWTError
 
 app = FastAPI(title="Healthcare Chatbot", version="0.2.0")
 
@@ -145,9 +146,16 @@ class Question(BaseModel):
     is_compulsory: bool  # True = user must manually enter; False = app can auto-populate from profile
 
 
+class StoredAnswer(BaseModel):
+    question_id: str
+    question_text: str
+    answer_json: Dict[str, Any]
+
+
 class AssessmentStartResponse(BaseModel):
     session_id: str
     question: Question
+    stored_answers: List[StoredAnswer] = []
 
 
 class AnswerRequest(BaseModel):
@@ -355,12 +363,26 @@ def extract_assessment_topic(answers: dict) -> str:
 # ─────────────────────────────
 
 @app.get("/assessment/start", response_model=AssessmentStartResponse)
-def start_assessment():
-    """Start assessment and return first question"""
+def start_assessment(request: Request):
+    """
+    Start assessment and return:
+      - session_id
+      - first question
+      - stored_answers: all Q&A previously saved for this user
+        (merged from user_profiles + user_medical_data tables)
+
+    JWT is optional — if valid, stored answers are returned so the app
+    can auto-populate answers from local cache without extra API calls.
+    If no/invalid JWT, stored_answers is empty and app collects everything fresh.
+    """
+    from app.auth.auth_config import JWT_SECRET_KEY, JWT_ALGORITHM
+    from app.auth.profile_db import get_profile_by_user_id
+    from app.auth.medical_db import get_medical_by_user_id
+
     session_id = str(uuid.uuid4())
     questionnaire = load_questionnaire()
     first_q = questionnaire["questions"][0]
-    
+
     # Initialize session
     sessions[session_id] = {
         "answers": {},
@@ -371,16 +393,39 @@ def start_assessment():
         "followup_index": 0,
         "detected_symptom": None
     }
-    
+
     # Build question response
     question = build_question_response(first_q)
-    
+
+    # ── Fetch stored answers from JWT (optional) ──────────────────────
+    stored_answers = []
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            user_id = payload.get("sub")
+            if user_id:
+                # Merge profile + medical answers (profile first, then medical)
+                profile_rows = get_profile_by_user_id(user_id)
+                medical_rows = get_medical_by_user_id(user_id)
+                for row in profile_rows + medical_rows:
+                    stored_answers.append(StoredAnswer(
+                        question_id=row["question_id"],
+                        question_text=row["question_text"],
+                        answer_json=row["answer_json"]
+                    ))
+        except JWTError:
+            pass  # No stored answers — app collects fresh
+
     print(f"\n[START] New session: {session_id[:8]}...")
-    print(f"[START] First question: {first_q['id']}\n")
-    
+    print(f"[START] First question: {first_q['id']}")
+    print(f"[START] Stored answers returned: {len(stored_answers)}\n")
+
     return AssessmentStartResponse(
         session_id=session_id,
-        question=question
+        question=question,
+        stored_answers=stored_answers
     )
 
 
