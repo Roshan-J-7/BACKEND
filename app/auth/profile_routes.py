@@ -20,6 +20,7 @@ from jose import jwt, JWTError
 
 from app.auth.auth_config import JWT_SECRET_KEY, JWT_ALGORITHM
 from app.auth.profile_db import save_profile_answers, get_profile_by_user_id
+from app.auth.medical_db import save_medical_answers, get_medical_by_user_id
 
 # ─────────────────────────────
 # Router
@@ -168,4 +169,111 @@ async def get_profile(request: Request):
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"success": True, "profile": profile}
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Medical Data Onboarding
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/medical/onboarding", status_code=status.HTTP_200_OK)
+async def onboard_medical(request: Request, body: OnboardingRequest):
+    """
+    Store user medical history answers after profile onboarding.
+
+    Uses the same structured format as profile onboarding.
+    Covers health-specific questions from questionnaire.json
+    (is_compulsory=false, excluding profile fields).
+
+    Request:
+      POST /user/medical/onboarding
+      Authorization: Bearer <jwt_token>
+      {
+        "answer_json": [
+          { "question_id": "q_med_history",
+            "question_text": "Do you have any past medical conditions?",
+            "answer_json": { "type": "single_choice", "selected_option_label": "diabetes" } },
+          { "question_id": "q_medication_list",
+            "question_text": "Please list all medications and supplements:",
+            "answer_json": { "type": "text", "value": "Metformin 500mg daily" } }
+        ]
+      }
+
+    Response:
+      { "success": true, "message": "Medical data stored successfully" }
+    """
+    # Step 1: Extract user_id from JWT
+    user_id = extract_user_id_from_request(request)
+    if not user_id:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"success": False, "message": "Invalid token"}
+        )
+
+    # Step 2: Validate payload
+    if not body.answer_json:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": "No medical data provided"}
+        )
+
+    # Step 3: Save to DB
+    try:
+        answers = [
+            {
+                "question_id": item.question_id,
+                "question_text": item.question_text,
+                "answer_json": item.answer_json
+            }
+            for item in body.answer_json
+        ]
+        save_medical_answers(user_id=user_id, answers=answers)
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Failed to store medical data: {str(e)}"}
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"success": True, "message": "Medical data stored successfully"}
+    )
+
+
+@router.get("/medical", status_code=status.HTTP_200_OK)
+async def get_medical(request: Request):
+    """
+    Fetch stored medical data for the authenticated user.
+
+    Request:
+      GET /user/medical
+      Authorization: Bearer <jwt_token>
+
+    Response:
+      {
+        "success": true,
+        "medical": [
+          { "question_id": "q_med_history", "question_text": "...", "answer_json": {...} },
+          ...
+        ]
+      }
+    """
+    user_id = extract_user_id_from_request(request)
+    if not user_id:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"success": False, "message": "Invalid token"}
+        )
+
+    try:
+        medical = get_medical_by_user_id(user_id)
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Failed to fetch medical data: {str(e)}"}
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"success": True, "medical": medical}
     )

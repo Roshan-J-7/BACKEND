@@ -38,6 +38,7 @@ app.include_router(auth_router)
 # ─────────────────────────────
 from app.auth.profile_routes import router as profile_router
 from app.auth.profile_db import init_profile_db
+from app.auth.medical_db import init_medical_db
 app.include_router(profile_router)
 
 # ─────────────────────────────
@@ -58,6 +59,8 @@ async def startup_event():
     init_auth_db()
     # Initialize profile DB (user_profiles table — linked to users via FK)
     init_profile_db()
+    # Initialize medical DB (user_medical_data table — linked to users via FK)
+    init_medical_db()
     
     # Vision model loading paused - see app/vision_model/ for details
     # To resume: uncomment vision imports above and the vision loading code below
