@@ -40,6 +40,7 @@ app.include_router(auth_router)
 from app.auth.profile_routes import router as profile_router
 from app.auth.profile_db import init_profile_db
 from app.auth.medical_db import init_medical_db
+from app.auth.reports_db import init_reports_db, save_report
 app.include_router(profile_router)
 
 # ─────────────────────────────
@@ -62,6 +63,8 @@ async def startup_event():
     init_profile_db()
     # Initialize medical DB (user_medical_data table — linked to users via FK)
     init_medical_db()
+    # Initialize reports DB (reports table — stores all generated assessment reports)
+    init_reports_db()
     
     # Vision model loading paused - see app/vision_model/ for details
     # To resume: uncomment vision imports above and the vision loading code below
@@ -611,8 +614,10 @@ def submit_answer(req: AnswerRequest):
 
 
 @app.post("/assessment/report", response_model=MedicalReportResponse)
-def receive_report(req: ReportRequest):
-    """Receive completed assessment responses, generate medical report using LLM"""
+def receive_report(req: ReportRequest, request: Request):
+    """Receive completed assessment responses, generate medical report using LLM.
+    If JWT is present in Authorization header, the report is also persisted to
+    the `reports` table linked to that user."""
     from app.core.llm_client import generate_medical_report
     
     # Generate session_id if not provided
@@ -683,6 +688,27 @@ def receive_report(req: ReportRequest):
     print(f"Advice items: {len(medical_report.get('advice', []))}")
     print(f"{'='*60}\n")
     
+    # ── Persist report to DB if JWT present ──────────────────────────────
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        from jose import jwt as _jwt, JWTError as _JWTError
+        from app.auth.auth_config import JWT_SECRET_KEY, JWT_ALGORITHM
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            payload = _jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            user_id = payload.get("sub")
+            if user_id:
+                save_report(user_id=user_id, report=medical_report)
+                print(f"[REPORT] Persisted to DB for user {user_id[:8]}...")
+            else:
+                print("[REPORT] JWT has no 'sub' — report not persisted")
+        except _JWTError as e:
+            print(f"[REPORT] JWT decode error: {e} — report not persisted")
+        except Exception as e:
+            print(f"[REPORT] DB save error: {e} — report not persisted (still returned to app)")
+    else:
+        print("[REPORT] No JWT — report generated but not persisted")
+
     # Return structured medical report
     return MedicalReportResponse(**medical_report)
 

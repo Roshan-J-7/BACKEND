@@ -21,6 +21,7 @@ from jose import jwt, JWTError
 from app.auth.auth_config import JWT_SECRET_KEY, JWT_ALGORITHM
 from app.auth.profile_db import save_profile_answers, get_profile_by_user_id
 from app.auth.medical_db import save_medical_answers, get_medical_by_user_id
+from app.auth.reports_db import get_reports_by_user_id
 
 # ─────────────────────────────
 # Router
@@ -248,15 +249,6 @@ async def get_medical(request: Request):
     Request:
       GET /user/medical
       Authorization: Bearer <jwt_token>
-
-    Response:
-      {
-        "success": true,
-        "medical": [
-          { "question_id": "q_med_history", "question_text": "...", "answer_json": {...} },
-          ...
-        ]
-      }
     """
     user_id = extract_user_id_from_request(request)
     if not user_id:
@@ -276,4 +268,54 @@ async def get_medical(request: Request):
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"success": True, "medical": medical}
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reports
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/reports", status_code=status.HTTP_200_OK)
+async def get_reports(request: Request):
+    """
+    Fetch all previously generated assessment reports for the authenticated user.
+    Newest report first.
+
+    Request:
+      GET /user/reports
+      Authorization: Bearer <jwt_token>
+
+    Response:
+      {
+        "success": true,
+        "reports": [
+          {
+            "report_id": "d4c47b3f-...",
+            "assessment_topic": "fever",
+            "urgency_level": "yellow_doctor_visit",
+            "report_data": { ...full report JSON... },
+            "created_at": "2026-02-26T10:30:00Z"
+          },
+          ...
+        ]
+      }
+    """
+    user_id = extract_user_id_from_request(request)
+    if not user_id:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"success": False, "message": "Invalid token"}
+        )
+
+    try:
+        reports = get_reports_by_user_id(user_id)
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": f"Failed to fetch reports: {str(e)}"}
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"success": True, "reports": reports}
     )
