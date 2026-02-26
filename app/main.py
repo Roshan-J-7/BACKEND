@@ -688,7 +688,13 @@ def receive_report(req: ReportRequest, request: Request):
     print(f"Advice items: {len(medical_report.get('advice', []))}")
     print(f"{'='*60}\n")
     
+    # Build the final response object — Pydantic validates and normalises all fields.
+    # This is the EXACT JSON the app will receive.
+    report_response = MedicalReportResponse(**medical_report)
+
     # ── Persist report to DB if JWT present ──────────────────────────────
+    # Save report_response.dict() — identical to what FastAPI serialises to the app,
+    # so GET /user/reports always returns the same JSON shape.
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         from jose import jwt as _jwt, JWTError as _JWTError
@@ -698,7 +704,7 @@ def receive_report(req: ReportRequest, request: Request):
             payload = _jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
             user_id = payload.get("sub")
             if user_id:
-                save_report(user_id=user_id, report=medical_report)
+                save_report(user_id=user_id, report=report_response.dict())
                 print(f"[REPORT] Persisted to DB for user {user_id[:8]}...")
             else:
                 print("[REPORT] JWT has no 'sub' — report not persisted")
@@ -709,8 +715,7 @@ def receive_report(req: ReportRequest, request: Request):
     else:
         print("[REPORT] No JWT — report generated but not persisted")
 
-    # Return structured medical report
-    return MedicalReportResponse(**medical_report)
+    return report_response
 
 
 # ═════════════════════════════════════════════════════════════
