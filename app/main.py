@@ -185,8 +185,7 @@ class SimpleQA(BaseModel):
 
 
 class ReportRequest(BaseModel):
-    session_id: Optional[str] = None
-    responses: List[SimpleQA]
+    session_id: str
 
 
 class EndSessionRequest(BaseModel):
@@ -616,86 +615,79 @@ def submit_answer(req: AnswerRequest):
 
 @app.post("/assessment/report", response_model=MedicalReportResponse)
 def receive_report(req: ReportRequest, request: Request):
-    """Receive completed assessment responses, generate medical report using LLM.
-    If JWT is present in Authorization header, the report is also persisted to
-    the `reports` table linked to that user."""
+    """Generate a medical report from the completed session.
+    Reconstructs all Q&A from the in-memory sessions dict using session_id.
+    If JWT is present, the report is also persisted to the reports table."""
     from app.core.llm_client import generate_medical_report
-    
-    # Generate session_id if not provided
-    session_id = req.session_id or str(uuid.uuid4())
-    
+
+    session_id = req.session_id
+
     print(f"\n{'='*60}")
-    print(f"📊 ASSESSMENT REPORT RECEIVED")
+    print(f"📊 ASSESSMENT REPORT REQUEST")
     print(f"{'='*60}")
     print(f"Session ID: {session_id}")
-    print(f"Total Responses: {len(req.responses)}")
+
+    # ── Reconstruct responses from in-memory session ──────────────────
+    if session_id not in sessions:
+        print(f"[REPORT] ERROR: session {session_id[:8]}... not found")
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Session not found. Please start a new assessment.")
+
+    session = sessions[session_id]
+    answers_dict = session.get("answers", {})  # {question_id: answer_text}
+
+    # Build a question_id → question_text lookup from questionnaire + followup
+    questionnaire = load_questionnaire()
+    q_text_map = {}
+    for q in questionnaire["questions"]:
+        q_text_map[q["id"]] = q["question"]
+    for q in questionnaire.get("conditional", {}).get("q_gender=female", []):
+        q_text_map[q["id"]] = q["question"]
+
+    followup_qs = session.get("followup_questions") or {}
+    for qid, qdata in followup_qs.items():
+        q_text_map[qid] = qdata["question"]
+
+    # Build responses_data list for LLM
+    responses_data = []
+    for qid, answer_value in answers_dict.items():
+        responses_data.append({
+            "question": q_text_map.get(qid, qid),
+            "answer": str(answer_value) if answer_value is not None else ""
+        })
+
+    print(f"Total Responses reconstructed: {len(responses_data)}")
     print(f"{'='*60}\n")
-    
-    # Store responses in-memory session store
-    responses_data = [qa.dict() for qa in req.responses]
-    session_store[session_id] = responses_data
-    
-    # Extract chief complaint and detect symptom
-    chief_complaint = None
-    for qa in req.responses:
-        if "chief complaint" in qa.question.lower() or "current ailment" in qa.question.lower():
-            chief_complaint = qa.answer
-            break
-    
-    # Try to detect symptom from chief complaint
-    detected_symptom = None
+
+    for i, qa in enumerate(responses_data, 1):
+        print(f"  {i}. Q: {qa['question']}")
+        print(f"     A: {qa['answer']}")
+
+    # ── Symptom data from session (already detected during answer phase) ──
+    detected_symptom_raw = session.get("detected_symptom")
     symptom_data = None
-    
-    if chief_complaint:
-        print(f"\n🔍 Analyzing chief complaint: '{chief_complaint}'")
-        detected_symptom = detect_symptom(chief_complaint)
-        if detected_symptom:
-            print(f"✅ Matched to: {detected_symptom['label']} ({detected_symptom['symptom_id']})")
-            
-            # Load full symptom data from decision tree
-            decision_tree = load_decision_tree()
-            symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
-            for s in symptoms:
-                if s["symptom_id"] == detected_symptom["symptom_id"]:
-                    symptom_data = s
-                    break
-    
-    # Print all responses for verification
-    print(f"\n{'='*60}")
-    print(f"PATIENT RESPONSES:")
-    print(f"{'='*60}")
-    for i, qa in enumerate(req.responses, 1):
-        print(f"  {i}. Q: {qa.question}")
-        print(f"     A: {qa.answer}")
-    
-    print(f"\n{'='*60}")
-    print(f"✅ Stored {len(req.responses)} responses for session {session_id[:8]}...")
-    print(f"📦 Storage: session_store['{session_id[:8]}...']")
-    if detected_symptom:
-        print(f"🎯 Detected Symptom: {detected_symptom['label']}")
-    print(f"{'='*60}\n")
-    
-    # Generate medical report using LLM
-    print(f"🤖 Generating medical report using LLM...")
+    if detected_symptom_raw:
+        symptom_id = detected_symptom_raw.get("symptom_id")
+        decision_tree = load_decision_tree()
+        for s in decision_tree["symptom_decision_tree"]["symptoms"]:
+            if s["symptom_id"] == symptom_id:
+                symptom_data = s
+                break
+        print(f"🎯 Detected Symptom: {detected_symptom_raw.get('label')}")
+
+    # ── Generate medical report ───────────────────────────────────────
+    print(f"\n🤖 Generating medical report using LLM...")
     medical_report = generate_medical_report(responses_data, symptom_data)
-    
+
     print(f"\n{'='*60}")
     print(f"✅ MEDICAL REPORT GENERATED")
-    print(f"{'='*60}")
     print(f"Topic: {medical_report.get('assessment_topic', 'N/A')}")
     print(f"Urgency: {medical_report.get('urgency_level', 'N/A')}")
-    print(f"Summary points: {len(medical_report.get('summary', []))}")
-    print(f"Possible causes: {len(medical_report.get('possible_causes', []))}")
-    print(f"Advice items: {len(medical_report.get('advice', []))}")
     print(f"{'='*60}\n")
-    
-    # Build the final response object — Pydantic validates and normalises all fields.
-    # This is the EXACT JSON the app will receive.
+
     report_response = MedicalReportResponse(**medical_report)
 
-    # ── Persist report to DB if JWT present ──────────────────────────────
-    # Save report_response.dict() — identical to what FastAPI serialises to the app,
-    # so GET /user/reports always returns the same JSON shape.
+    # ── Persist to DB if JWT present ──────────────────────────────────
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         from jose import jwt as _jwt, JWTError as _JWTError
