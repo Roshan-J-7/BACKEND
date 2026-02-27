@@ -315,7 +315,8 @@ async def get_reports(request: Request):
             content={"success": False, "message": f"Failed to fetch reports: {str(e)}"}
         )
 
+    # Return array directly — same JSON shape the report was originally sent to the app
     return JSONResponse(
         status_code=status.HTTP_200_OK,
-        content={"success": True, "reports": reports}
+        content=reports
     )

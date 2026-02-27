@@ -41,6 +41,11 @@ from app.auth.profile_routes import router as profile_router
 from app.auth.profile_db import init_profile_db
 from app.auth.medical_db import init_medical_db
 from app.auth.reports_db import init_reports_db, save_report
+from app.auth.assessment_db import (
+    init_assessment_db, get_active_session, create_session, get_session_by_id,
+    update_session_phase, complete_session, expire_session,
+    save_session_answer, get_session_answers, get_session_answers_full
+)
 app.include_router(profile_router)
 
 # ─────────────────────────────
@@ -65,6 +70,8 @@ async def startup_event():
     init_medical_db()
     # Initialize reports DB (reports table — stores all generated assessment reports)
     init_reports_db()
+    # Initialize assessment DB (assessment_sessions + assessment_session_answers)
+    init_assessment_db()
     
     # Vision model loading paused - see app/vision_model/ for details
     # To resume: uncomment vision imports above and the vision loading code below
@@ -184,8 +191,14 @@ class SimpleQA(BaseModel):
 
 
 class ReportRequest(BaseModel):
-    session_id: Optional[str] = None
-    responses: List[SimpleQA]
+    session_id: str  # App sends ONLY session_id; server fetches all data from DB
+
+
+class NewAnswerRequest(BaseModel):
+    session_id: str
+    question_id: str
+    question_text: str
+    answer_json: Dict[str, Any]
 
 
 class EndSessionRequest(BaseModel):
@@ -288,11 +301,105 @@ followup_store = {}  # {session_id: [{"question": "...", "answer": "..."}, ...]}
 # Conversation history for LLM phase (stores all chat turns)
 conversation_history = {}
 
-# Session storage for questionnaire flow
+# Session storage for questionnaire flow (LEGACY — kept for chatbot routes)
 sessions = {}
 
 # Session storage for follow-up questions flow
 followup_sessions = {}  # {session_id: {"symptom": "...", "current_index": 0, "questions": [...]}}
+
+
+# ─────────────────────────────
+# Assessment Helpers
+# ─────────────────────────────
+
+def _extract_user_id(request: Request) -> Optional[str]:
+    """Decode JWT from Authorization header and return user_id (sub claim), or None."""
+    from app.auth.auth_config import JWT_SECRET_KEY, JWT_ALGORITHM
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+def answer_json_to_text(answer_json: dict) -> str:
+    """Extract a human-readable string from an answer_json dict for LLM consumption."""
+    t = answer_json.get("type", "")
+    if t == "text":
+        return str(answer_json.get("value", ""))
+    elif t == "number":
+        return str(answer_json.get("number_value", answer_json.get("value", "")))
+    elif t == "single_choice":
+        return answer_json.get("selected_option_label", "").replace("_", " ")
+    elif t == "multi_choice":
+        return ", ".join(answer_json.get("selected_option_labels", []))
+    return str(answer_json.get("value", ""))
+
+
+def compute_next_question(answers_dict: dict, session_phase: str,
+                          detected_symptom_id: Optional[str],
+                          questionnaire: dict, decision_tree: dict) -> tuple:
+    """
+    Given the current set of answered questions, return the next question to ask.
+
+    Returns:
+        (question_dict | None, new_phase, new_detected_symptom_id)
+
+    question_dict has keys: id, text (or question), type, options, is_compulsory
+    Returns (None, phase, symptom_id) when all questions are answered.
+    """
+    answered_ids = set(answers_dict.keys())
+
+    if session_phase in ("questionnaire", None):
+        all_qs = questionnaire["questions"].copy()
+
+        # Add conditional questions if gender is female
+        gender_answer = answers_dict.get("q_gender", {})
+        gender_val = gender_answer.get("selected_option_label", "").lower()
+        if gender_val == "female":
+            conditionals = questionnaire.get("conditional", {}).get("q_gender=female", [])
+            all_qs.extend(conditionals)
+
+        # Find first unanswered questionnaire question
+        for q in all_qs:
+            if q["id"] not in answered_ids:
+                return q, "questionnaire", detected_symptom_id
+
+        # All questionnaire questions answered — try to transition to followup
+        chief_answer = answers_dict.get("q_current_ailment", {})
+        chief_text = chief_answer.get("value", "")
+        detected = detect_symptom(chief_text) if chief_text else None
+
+        if detected:
+            detected_symptom_id = detected["symptom_id"]
+            session_phase = "followup"
+        else:
+            return None, "questionnaire", None
+
+    # Follow-up phase
+    if session_phase == "followup" and detected_symptom_id:
+        symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
+        symptom_data = next((s for s in symptoms if s["symptom_id"] == detected_symptom_id), None)
+        if symptom_data and "followup_questions" in symptom_data:
+            for key, q_data in symptom_data["followup_questions"].items():
+                if key not in answered_ids:
+                    return (
+                        {
+                            "id": key,
+                            "text": q_data["question"],
+                            "type": q_data["type"],
+                            "options": q_data.get("options", []),
+                            "is_compulsory": True
+                        },
+                        "followup",
+                        detected_symptom_id
+                    )
+
+    return None, session_phase, detected_symptom_id
 
 
 def cleanup_session(session_id: str) -> bool:
@@ -368,74 +475,77 @@ def extract_assessment_topic(answers: dict) -> str:
 @app.get("/assessment/start", response_model=AssessmentStartResponse)
 def start_assessment(request: Request):
     """
-    Start assessment and return:
-      - session_id
-      - first question
-      - stored_answers: all Q&A previously saved for this user
-        (merged from user_profiles + user_medical_data tables)
+    Start or resume an assessment session.
 
-    JWT is optional — if valid, stored answers are returned so the app
-    can auto-populate answers from local cache without extra API calls.
-    If no/invalid JWT, stored_answers is empty and app collects everything fresh.
+    - JWT required in Authorization header.
+    - If the user has an active session, resumes it (crash-safe).
+    - If not, creates a new session.
+    - Returns the next unanswered question + all stored profile/medical answers
+      so the app can auto-populate from local cache.
     """
-    from app.auth.auth_config import JWT_SECRET_KEY, JWT_ALGORITHM
     from app.auth.profile_db import get_profile_by_user_id
     from app.auth.medical_db import get_medical_by_user_id
+    from fastapi.responses import JSONResponse as _JSONResponse
 
-    session_id = str(uuid.uuid4())
-    questionnaire = load_questionnaire()
-    first_q = questionnaire["questions"][0]
+    user_id = _extract_user_id(request)
+    if not user_id:
+        return _JSONResponse(
+            status_code=401,
+            content={"success": False, "message": "Authorization required"}
+        )
 
-    # Initialize session
-    sessions[session_id] = {
-        "answers": {},
-        "current_index": 0,
-        "total_questions": len(questionnaire["questions"]),
-        "phase": "questionnaire",  # "questionnaire" or "followup"
-        "followup_questions": None,  # Will be populated after questionnaire
-        "followup_index": 0,
-        "detected_symptom": None
-    }
-
-    # Build question response
-    question = build_question_response(first_q)
-
-    # ── Fetch stored answers from JWT (optional) ──────────────────────
-    stored_answers = []
-    auth_header = request.headers.get("Authorization", "")
-
-    print(f"[START] Auth header present: {bool(auth_header)}")
-
-    if not auth_header.startswith("Bearer "):
-        print("[START] WARNING: No Bearer token in Authorization header — stored_answers will be empty")
+    # Get or create active session
+    session = get_active_session(user_id)
+    if not session:
+        session = create_session(user_id)
+        print(f"[START] Created new session for user {user_id[:8]}...")
     else:
-        token = auth_header.split(" ", 1)[1].strip()
-        try:
-            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-            user_id = payload.get("sub")
-            print(f"[START] JWT decoded OK — user_id: {user_id}")
+        print(f"[START] Resuming session {str(session['session_id'])[:8]}... for user {user_id[:8]}...")
 
-            if not user_id:
-                print("[START] WARNING: JWT has no 'sub' field — stored_answers will be empty")
-            else:
-                profile_rows = get_profile_by_user_id(user_id)
-                medical_rows = get_medical_by_user_id(user_id)
-                print(f"[START] Profile rows: {len(profile_rows)} | Medical rows: {len(medical_rows)}")
+    session_id = str(session["session_id"])
 
-                for row in profile_rows + medical_rows:
-                    stored_answers.append(StoredAnswer(
-                        question_id=row["question_id"],
-                        question_text=row["question_text"],
-                        answer_json=row["answer_json"]
-                    ))
-        except JWTError as e:
-            print(f"[START] JWT decode error: {e} — stored_answers will be empty")
-        except Exception as e:
-            print(f"[START] DB fetch error: {e} — stored_answers will be empty")
+    # Determine next unanswered question
+    answers_dict = get_session_answers(session_id)
+    questionnaire = load_questionnaire()
+    decision_tree = load_decision_tree()
 
-    print(f"\n[START] New session: {session_id[:8]}...")
-    print(f"[START] First question: {first_q['id']}")
-    print(f"[START] Stored answers returned: {len(stored_answers)}\n")
+    next_q, new_phase, new_symptom = compute_next_question(
+        answers_dict,
+        session["phase"],
+        session.get("detected_symptom"),
+        questionnaire,
+        decision_tree
+    )
+
+    # Persist phase transition if it changed
+    if new_phase != session["phase"] or (new_symptom and new_symptom != session.get("detected_symptom")):
+        update_session_phase(session_id, new_phase, new_symptom)
+
+    # All questions already answered — session is complete
+    if next_q is None:
+        return _JSONResponse(
+            status_code=200,
+            content={"session_id": session_id, "status": "completed", "stored_answers": []}
+        )
+
+    question = build_question_response(next_q)
+
+    # Fetch stored profile + medical answers for app-side auto-population
+    stored_answers = []
+    try:
+        profile_rows = get_profile_by_user_id(user_id)
+        medical_rows = get_medical_by_user_id(user_id)
+        for row in profile_rows + medical_rows:
+            stored_answers.append(StoredAnswer(
+                question_id=row["question_id"],
+                question_text=row["question_text"],
+                answer_json=row["answer_json"]
+            ))
+    except Exception as e:
+        print(f"[START] Failed to fetch stored answers: {e}")
+
+    print(f"[START] session={session_id[:8]}... | next_q={next_q['id']} | "
+          f"answered={len(answers_dict)} | stored={len(stored_answers)}")
 
     return AssessmentStartResponse(
         session_id=session_id,
@@ -445,277 +555,166 @@ def start_assessment(request: Request):
 
 
 @app.post("/assessment/answer", response_model=AnswerResponse)
-def submit_answer(req: AnswerRequest):
-    """Handle answer and return next question"""
-    session_id = req.session_id
-    
-    # Validate session exists
-    if session_id not in sessions:
-        print(f"[ERROR] Session {session_id[:8]}... not found")
-        return AnswerResponse(
-            session_id=session_id,
-            status="error"
-        )
-    
-    # Store answer based on type
-    answer_data = req.answer
-    question_id = req.question.question_id
-    
-    # Extract answer value based on type
-    if answer_data.get("type") == "number":
-        answer_value = answer_data.get("value")
-    elif answer_data.get("type") == "single_choice":
-        answer_value = answer_data.get("selected_option_label", answer_data.get("selected_option_id", answer_data.get("value")))
-    elif answer_data.get("type") == "multi_choice":
-        answer_value = ", ".join(answer_data.get("selected_option_labels", []))
-    else:
-        answer_value = answer_data.get("value", "")
-    
-    sessions[session_id]["answers"][question_id] = answer_value
-    
-    print(f"[ANSWER] Session {session_id[:8]}... answered {question_id}: {answer_value}")
-    
-    # Get session phase
-    phase = sessions[session_id].get("phase", "questionnaire")
-    
-    if phase == "questionnaire":
-        # QUESTIONNAIRE PHASE
-        questionnaire = load_questionnaire()
-        all_questions = questionnaire["questions"].copy()
-        
-        # Check for conditional questions (female → pregnancy/menstrual)
-        answers = sessions[session_id]["answers"]
-        gender = answers.get("q_gender")
-        if gender and gender.lower() == "female":
-            conditional = questionnaire.get("conditional", {}).get("q_gender=female", [])
-            all_questions.extend(conditional)
-        
-        # Find next question
-        current_index = sessions[session_id]["current_index"]
-        next_index = current_index + 1
-        
-        # Check if questionnaire is complete
-        if next_index >= len(all_questions):
-            print(f"\n{'='*60}")
-            print(f"✅ QUESTIONNAIRE COMPLETE")
-            print(f"{'='*60}")
-            
-            # Detect symptom from chief complaint
-            chief_complaint = answers.get("q_current_ailment", "")
-            detected = detect_symptom(chief_complaint) if chief_complaint else None
-            
-            if detected:
-                symptom_id = detected["symptom_id"]
-                print(f"🔍 Detected symptom: {detected['label']} ({symptom_id})")
-                print(f"🔄 Transitioning to FOLLOW-UP questions...\n")
-                
-                # Load follow-up questions for detected symptom
-                decision_tree = load_decision_tree()
-                symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
-                symptom_data = next((s for s in symptoms if s["symptom_id"] == symptom_id), None)
-                
-                if symptom_data and "followup_questions" in symptom_data:
-                    followup_qs = symptom_data["followup_questions"]
-                    question_keys = list(followup_qs.keys())
-                    
-                    # Update session to follow-up phase
-                    sessions[session_id]["phase"] = "followup"
-                    sessions[session_id]["followup_questions"] = followup_qs
-                    sessions[session_id]["followup_keys"] = question_keys
-                    sessions[session_id]["followup_index"] = 0
-                    sessions[session_id]["detected_symptom"] = detected
-                    
-                    # Return first follow-up question
-                    first_key = question_keys[0]
-                    first_q_data = followup_qs[first_key]
-                    
-                    question = Question(
-                        question_id=first_key,
-                        text=first_q_data["question"],
-                        response_type=first_q_data["type"],
-                        response_options=[
-                            {"id": opt, "label": opt.replace("_", " ").title()}
-                            for opt in first_q_data.get("options", [])
-                        ] if "options" in first_q_data else None,
-                        is_compulsory=True  # Follow-up questions are always compulsory
-                    )
-                    
-                    print(f"[FOLLOWUP] Question 1/{len(question_keys)}: {first_key}\n")
-                    
-                    return AnswerResponse(
-                        session_id=session_id,
-                        question=question
-                    )
-            
-            # No symptom detected or no follow-up questions - end here
-            print(f"⚠️  No symptom detected or no follow-up questions available")
-            print(f"📊 Ready for final report\n")
-            
-            return AnswerResponse(
-                session_id=session_id,
-                status="completed"
-            )
-        
-        # Return next questionnaire question
-        sessions[session_id]["current_index"] = next_index
-        next_q = all_questions[next_index]
-        question = build_question_response(next_q)
-        
-        print(f"[NEXT] Session {session_id[:8]}... question {next_index + 1}/{len(all_questions)}: {next_q['id']}")
-        
-        return AnswerResponse(
-            session_id=session_id,
-            question=question
-        )
-    
-    else:
-        # FOLLOW-UP PHASE
-        followup_qs = sessions[session_id]["followup_questions"]
-        question_keys = sessions[session_id]["followup_keys"]
-        current_index = sessions[session_id]["followup_index"]
-        
-        # Move to next follow-up question
-        next_index = current_index + 1
-        
-        # Check if follow-ups are complete
-        if next_index >= len(question_keys):
-            print(f"\n{'='*60}")
-            print(f"✅ FOLLOW-UP QUESTIONS COMPLETE")
-            print(f"📊 Ready for final report with ALL questions\n")
-            print(f"{'='*60}\n")
-            
-            return AnswerResponse(
-                session_id=session_id,
-                status="completed"
-            )
-        
-        # Return next follow-up question
-        sessions[session_id]["followup_index"] = next_index
-        next_key = question_keys[next_index]
-        next_q_data = followup_qs[next_key]
-        
-        question = Question(
-            question_id=next_key,
-            text=next_q_data["question"],
-            response_type=next_q_data["type"],
-            response_options=[
-                {"id": opt, "label": opt.replace("_", " ").title()}
-                for opt in next_q_data.get("options", [])
-            ] if "options" in next_q_data else None,
-            is_compulsory=True  # Follow-up questions are always compulsory
-        )
-        
-        print(f"[FOLLOWUP] Session {session_id[:8]}... question {next_index + 1}/{len(question_keys)}: {next_key}\n")
-        
-        return AnswerResponse(
-            session_id=session_id,
-            question=question
-        )
+def submit_answer(req: NewAnswerRequest, request: Request):
+    """
+    Save one answer and return the next question (or 'completed').
+
+    Request body:
+      { session_id, question_id, question_text, answer_json }
+
+    The backend:
+      1. Validates JWT and confirms session belongs to the user
+      2. Persists answer to assessment_session_answers
+      3. Determines next unanswered question (handles auto-phase transitions)
+      4. Returns { status: 'next', question } or { status: 'completed' }
+    """
+    user_id = _extract_user_id(request)
+    if not user_id:
+        return AnswerResponse(session_id=req.session_id, status="error")
+
+    # Validate session ownership
+    session = get_session_by_id(req.session_id)
+    if not session or str(session["user_id"]) != user_id:
+        print(f"[ANSWER] Session {req.session_id[:8]}... not found or not owned by user")
+        return AnswerResponse(session_id=req.session_id, status="error")
+    if session["status"] != "active":
+        print(f"[ANSWER] Session {req.session_id[:8]}... is {session['status']}, not active")
+        return AnswerResponse(session_id=req.session_id, status="error")
+
+    # Persist the answer
+    save_session_answer(
+        session_id=req.session_id,
+        question_id=req.question_id,
+        question_text=req.question_text,
+        answer_json=req.answer_json
+    )
+    print(f"[ANSWER] {req.session_id[:8]}... saved {req.question_id}")
+
+    # Determine next question from DB state
+    answers_dict = get_session_answers(req.session_id)
+    questionnaire = load_questionnaire()
+    decision_tree = load_decision_tree()
+
+    next_q, new_phase, new_symptom = compute_next_question(
+        answers_dict,
+        session["phase"],
+        session.get("detected_symptom"),
+        questionnaire,
+        decision_tree
+    )
+
+    # Persist phase transition
+    if new_phase != session["phase"] or (new_symptom and new_symptom != session.get("detected_symptom")):
+        update_session_phase(req.session_id, new_phase, new_symptom)
+        print(f"[ANSWER] Phase transition: {session['phase']} → {new_phase} | symptom={new_symptom}")
+
+    if next_q is None:
+        print(f"[ANSWER] {req.session_id[:8]}... — all questions answered, status=completed")
+        return AnswerResponse(session_id=req.session_id, status="completed")
+
+    question = build_question_response(next_q)
+    print(f"[ANSWER] {req.session_id[:8]}... — next={next_q['id']}")
+    return AnswerResponse(session_id=req.session_id, question=question)
 
 
 @app.post("/assessment/report", response_model=MedicalReportResponse)
 def receive_report(req: ReportRequest, request: Request):
-    """Receive completed assessment responses, generate medical report using LLM.
-    If JWT is present in Authorization header, the report is also persisted to
-    the `reports` table linked to that user."""
+    """
+    Generate a medical report from a completed assessment session.
+
+    App sends ONLY session_id. The server:
+      1. Validates JWT and confirms session belongs to the user
+      2. Fetches all session answers from assessment_session_answers
+      3. Detects symptom from stored chief complaint
+      4. Generates report via LLM (Cerebras)
+      5. Persists report to reports table
+      6. Marks session as completed
+      7. Returns full report JSON (same format as /user/reports)
+    """
     from app.core.llm_client import generate_medical_report
-    
-    # Generate session_id if not provided
-    session_id = req.session_id or str(uuid.uuid4())
-    
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    user_id = _extract_user_id(request)
+    if not user_id:
+        return _JSONResponse(
+            status_code=401,
+            content={"success": False, "message": "Authorization required"}
+        )
+
+    session = get_session_by_id(req.session_id)
+    if not session or str(session["user_id"]) != user_id:
+        return _JSONResponse(
+            status_code=404,
+            content={"success": False, "message": "Session not found"}
+        )
+
+    # Fetch all answers for this session
+    session_answers_full = get_session_answers_full(req.session_id)
+
     print(f"\n{'='*60}")
-    print(f"📊 ASSESSMENT REPORT RECEIVED")
+    print(f"📊 GENERATING REPORT")
+    print(f"Session: {req.session_id[:8]}... | Answers: {len(session_answers_full)}")
     print(f"{'='*60}")
-    print(f"Session ID: {session_id}")
-    print(f"Total Responses: {len(req.responses)}")
-    print(f"{'='*60}\n")
-    
-    # Store responses in-memory session store
-    responses_data = [qa.dict() for qa in req.responses]
-    session_store[session_id] = responses_data
-    
-    # Extract chief complaint and detect symptom
-    chief_complaint = None
-    for qa in req.responses:
-        if "chief complaint" in qa.question.lower() or "current ailment" in qa.question.lower():
-            chief_complaint = qa.answer
-            break
-    
-    # Try to detect symptom from chief complaint
-    detected_symptom = None
+
+    # Convert to {question, answer} format for LLM
+    responses_data = [
+        {
+            "question": item["question_text"],
+            "answer": answer_json_to_text(item["answer_json"])
+        }
+        for item in session_answers_full
+    ]
+
+    # Load symptom context if available
+    detected_symptom_id = session.get("detected_symptom")
     symptom_data = None
-    
-    if chief_complaint:
-        print(f"\n🔍 Analyzing chief complaint: '{chief_complaint}'")
-        detected_symptom = detect_symptom(chief_complaint)
-        if detected_symptom:
-            print(f"✅ Matched to: {detected_symptom['label']} ({detected_symptom['symptom_id']})")
-            
-            # Load full symptom data from decision tree
-            decision_tree = load_decision_tree()
-            symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
-            for s in symptoms:
-                if s["symptom_id"] == detected_symptom["symptom_id"]:
-                    symptom_data = s
-                    break
-    
-    # Print all responses for verification
-    print(f"\n{'='*60}")
-    print(f"PATIENT RESPONSES:")
-    print(f"{'='*60}")
-    for i, qa in enumerate(req.responses, 1):
-        print(f"  {i}. Q: {qa.question}")
-        print(f"     A: {qa.answer}")
-    
-    print(f"\n{'='*60}")
-    print(f"✅ Stored {len(req.responses)} responses for session {session_id[:8]}...")
-    print(f"📦 Storage: session_store['{session_id[:8]}...']")
-    if detected_symptom:
-        print(f"🎯 Detected Symptom: {detected_symptom['label']}")
-    print(f"{'='*60}\n")
-    
-    # Generate medical report using LLM
-    print(f"🤖 Generating medical report using LLM...")
+    if detected_symptom_id:
+        decision_tree = load_decision_tree()
+        symptoms = decision_tree["symptom_decision_tree"]["symptoms"]
+        symptom_data = next((s for s in symptoms if s["symptom_id"] == detected_symptom_id), None)
+
+    # Generate report via LLM
     medical_report = generate_medical_report(responses_data, symptom_data)
-    
-    print(f"\n{'='*60}")
-    print(f"✅ MEDICAL REPORT GENERATED")
-    print(f"{'='*60}")
-    print(f"Topic: {medical_report.get('assessment_topic', 'N/A')}")
-    print(f"Urgency: {medical_report.get('urgency_level', 'N/A')}")
-    print(f"Summary points: {len(medical_report.get('summary', []))}")
-    print(f"Possible causes: {len(medical_report.get('possible_causes', []))}")
-    print(f"Advice items: {len(medical_report.get('advice', []))}")
-    print(f"{'='*60}\n")
-    
-    # Build the final response object — Pydantic validates and normalises all fields.
-    # This is the EXACT JSON the app will receive.
     report_response = MedicalReportResponse(**medical_report)
 
-    # ── Persist report to DB if JWT present ──────────────────────────────
-    # Save report_response.dict() — identical to what FastAPI serialises to the app,
-    # so GET /user/reports always returns the same JSON shape.
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        from jose import jwt as _jwt, JWTError as _JWTError
-        from app.auth.auth_config import JWT_SECRET_KEY, JWT_ALGORITHM
-        token = auth_header.split(" ", 1)[1].strip()
-        try:
-            payload = _jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-            user_id = payload.get("sub")
-            if user_id:
-                save_report(user_id=user_id, report=report_response.dict())
-                print(f"[REPORT] Persisted to DB for user {user_id[:8]}...")
-            else:
-                print("[REPORT] JWT has no 'sub' — report not persisted")
-        except _JWTError as e:
-            print(f"[REPORT] JWT decode error: {e} — report not persisted")
-        except Exception as e:
-            print(f"[REPORT] DB save error: {e} — report not persisted (still returned to app)")
-    else:
-        print("[REPORT] No JWT — report generated but not persisted")
+    print(f"✅ Report generated | topic={medical_report.get('assessment_topic')} | urgency={medical_report.get('urgency_level')}")
+
+    # Persist to reports table
+    try:
+        save_report(user_id=user_id, report=report_response.dict())
+        print(f"[REPORT] Saved to DB for user {user_id[:8]}...")
+    except Exception as e:
+        print(f"[REPORT] DB save error: {e} (report still returned to app)")
+
+    # Mark session completed
+    try:
+        complete_session(req.session_id)
+        print(f"[REPORT] Session {req.session_id[:8]}... marked completed")
+    except Exception as e:
+        print(f"[REPORT] Session complete error: {e}")
 
     return report_response
+
+
+@app.post("/assessment/end")
+def end_assessment(req: EndSessionRequest, request: Request):
+    """
+    Manually end/discard an active assessment session.
+    Marks session as expired — no report is generated.
+    """
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    user_id = _extract_user_id(request)
+    if not user_id:
+        return _JSONResponse(status_code=401, content={"success": False, "message": "Authorization required"})
+
+    session = get_session_by_id(req.session_id)
+    if not session or str(session["user_id"]) != user_id:
+        return _JSONResponse(status_code=404, content={"success": False, "message": "Session not found"})
+
+    expire_session(req.session_id)
+    print(f"[END] Session {req.session_id[:8]}... expired by user {user_id[:8]}...")
+    return _JSONResponse(status_code=200, content={"success": True, "message": "Session ended"})
 
 
 # ═════════════════════════════════════════════════════════════
