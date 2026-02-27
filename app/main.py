@@ -176,7 +176,7 @@ class AnswerRequest(BaseModel):
 
 class AnswerResponse(BaseModel):
     session_id: str
-    status: Optional[str] = None  # "completed" when all questions done
+    status: str = "next"  # "next" | "completed" | "error" — never null
     question: Optional[Question] = None
 
 
@@ -614,7 +614,7 @@ def submit_answer(req: NewAnswerRequest, request: Request):
 
     question = build_question_response(next_q)
     print(f"[ANSWER] {req.session_id[:8]}... — next={next_q['id']}")
-    return AnswerResponse(session_id=req.session_id, question=question)
+    return AnswerResponse(session_id=req.session_id, status="next", question=question)
 
 
 @app.post("/assessment/report", response_model=MedicalReportResponse)
