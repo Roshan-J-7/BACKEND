@@ -640,9 +640,9 @@ def receive_report(req: ReportRequest, request: Request):
     questionnaire = load_questionnaire()
     q_text_map = {}
     for q in questionnaire["questions"]:
-        q_text_map[q["id"]] = q["question"]
+        q_text_map[q["id"]] = q["text"]
     for q in questionnaire.get("conditional", {}).get("q_gender=female", []):
-        q_text_map[q["id"]] = q["question"]
+        q_text_map[q["id"]] = q["text"]
 
     followup_qs = session.get("followup_questions") or {}
     for qid, qdata in followup_qs.items():
