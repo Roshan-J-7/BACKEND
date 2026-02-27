@@ -163,13 +163,14 @@ class AssessmentStartResponse(BaseModel):
 
 class AnswerRequest(BaseModel):
     session_id: str
-    question: Question
-    answer: Dict[str, Any]  # Flexible structure for different answer types
+    question_id: str
+    question_text: str
+    answer_json: Dict[str, Any]  # {type, value} | {type, selected_option_label} | etc.
 
 
 class AnswerResponse(BaseModel):
     session_id: str
-    status: Optional[str] = None  # "completed" when all questions done
+    status: str = "next"  # "next" | "completed" | "error" — never null
     question: Optional[Question] = None
 
 
@@ -458,8 +459,8 @@ def submit_answer(req: AnswerRequest):
         )
     
     # Store answer based on type
-    answer_data = req.answer
-    question_id = req.question.question_id
+    answer_data = req.answer_json
+    question_id = req.question_id
     
     # Extract answer value based on type
     if answer_data.get("type") == "number":
